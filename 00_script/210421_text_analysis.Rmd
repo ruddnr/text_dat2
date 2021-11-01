@@ -1,0 +1,212 @@
+---
+title: "Dart 공시를 이용한 텍스트 마이닝"
+author: "장경욱"
+date: "`r Sys.Date()`"
+mainfont: NanumGothic
+output:
+  prettydoc::html_pretty:
+    df_print: paged
+    theme: cayman
+    highlight: github
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(DBI)
+library(odbc)
+library(dbplyr)
+library(tidyquant)
+library(httr)
+library(jsonlite)
+library(rvest)
+library(kableExtra)
+library(flextable)
+library(tidytext)
+library(RcppMeCab)
+library(KoNLP)
+# library(KoSpacing)
+library(furrr)
+library(dtplyr)
+library(quanteda)
+library(quanteda.textmodels)
+library(dtplyr)
+library(ggrepel)
+library(dtwclust)
+library(ggwordcloud)
+library(showtext)
+library(timetk)
+library(dygraphs)
+
+
+knitr::opts_chunk$set(
+  # cache = TRUE, 
+  # cache.lazy = FALSE, 
+  message = FALSE, 
+  warning = FALSE, 
+  fig.showtext = TRUE
+)
+
+set_flextable_defaults(
+  font.family = "나눔고딕",
+  font.size = 10,
+  digits = 3
+)
+
+custom_flextable <- function(dat, n) {
+  dat %>% 
+    head(n) %>% 
+    flextable() %>% 
+    autofit() %>% 
+    colformat_double(digits = 3)
+}
+
+theme_set(theme_minimal())
+
+```
+
+# 뉴스와 리포트 빈도에 따른 수익률 예측
+```{r}
+con <- dbConnect(RSQLite::SQLite(), "../TextDat.sqlite")
+
+stock_info <- tbl(con, "STOCK_INFO") %>%
+  filter(str_sub(CODE, 6, 6) == "0", ETF_GUBUN != "1", DELIST_DATE == "99999999") %>% 
+  select(code = 1, name = 2) %>% 
+  collect()
+
+date_tbl <- tbl(con, "MA") %>% 
+  select(date = FD, DDAY, TR) %>% 
+  collect() %>% 
+  mutate(date = ymd(date)) %>% 
+  filter(date >= "2019-12-02", date <= "2021-04-04") %>% 
+  mutate(wseq = (row_number()-1) %/% 7 + 1) %>% 
+  filter(date >= "2019-12-30")
+
+theme_jong <- tbl(con, "THEME_JONG")
+
+theme_ticker <- theme_jong %>% filter(theme_name == "풍력에너지") %>% 
+  collect() %>% 
+  left_join(stock_info %>% select(code = 1, name = 2))
+
+daily_return <- tbl(con, "DAILY_RETURN") %>%
+  filter(CODE %in% !!theme_ticker$code) %>% 
+  collect() %>% 
+  select(code = CODE, date = TD, return = RTN) %>% 
+  mutate(date = ymd(date), return = return + 1 )
+
+news <- tbl(con, "JONG_NEWS") %>% 
+  filter(code %in% !!theme_ticker$code) %>% 
+  collect() %>% 
+  mutate(date = parse_datetime(date, "%Y.%m.%d %H:%M") %>% as_date()) %>% 
+  arrange(date) %>% 
+  count(date, name = "news_count")  
+  
+
+report <- tbl(con, "FN_COMP_LIST") %>% 
+  collect() %>% 
+  mutate(code = str_remove(ITEM_CD, "A")) %>% 
+  semi_join(theme_ticker, by = "code") %>% 
+  select(date = FILTER_BULLET_DT, code) %>% 
+  mutate(date = ymd(date)) %>% 
+  count(date, name = "report_count")
+
+  
+# 포함 종목 동일가중 주간수익률  
+weekly_return <- date_tbl %>% 
+  left_join(daily_return) %>% 
+  mutate(return = replace_na(return, 1)) %>% 
+  
+  group_by(code, wseq) %>% 
+  summarise(return = prod(return) - 1) %>% 
+  ungroup() %>% 
+  
+  group_by(wseq) %>% 
+  summarise(return = mean(return)) %>% 
+  ungroup() %>% 
+  left_join(date_tbl %>% 
+              group_by(wseq) %>% 
+              filter(date == max(date)) %>% 
+              ungroup() %>% 
+              select(date, wseq)) %>% 
+  select(-wseq) %>% 
+  select(date, return)
+
+comb <- date_tbl %>% 
+  left_join(news) %>% 
+  left_join(report) %>% 
+  mutate(across(where(is.numeric), ~replace_na(., 0))) %>% 
+  group_by(wseq) %>% 
+  summarise(date = max(date),
+            news_count = sum(news_count),
+            report_count = sum(report_count)) %>% 
+  ungroup() %>% 
+  select(-wseq) %>% 
+  left_join(weekly_return) %>% 
+  filter(date >= "2020-03-31")
+
+comb %>% 
+  mutate(across(c(news_count, report_count), ~rollmean(., 5, fill = NA, align = "right"))) %>% 
+  mutate(return = cumprod(return+1)) %>% 
+  na.omit() %>% 
+  tk_xts() %>% 
+  dygraph()
+
+comb %>% 
+  mutate(across(where(is.numeric), ~scale(.))) %>% 
+  tk_xts() %>% 
+  dygraph()
+  
+```
+
+
+
+```{r}
+report <- tbl(con, "FN_COMP_LIST") %>% 
+  collect() %>% 
+  mutate(code = str_remove(ITEM_CD, "A")) %>% 
+  # semi_join(theme_ticker, by = "code") %>% 
+  select(date = FILTER_BULLET_DT, code) %>% 
+  mutate(date = ymd(date)) %>% 
+  left_join(date_tbl %>% select(date, wseq)) %>% 
+  count(wseq, code, name = "report_count")
+
+daily_return <- tbl(con, "DAILY_RETURN") %>%
+  # filter(CODE %in% !!theme_ticker$code) %>% 
+  collect() %>% 
+  select(code = CODE, date = TD, return = RTN) %>% 
+  mutate(date = ymd(date), return = return + 1 )
+
+  
+# 포함 종목 동일가중 주간수익률  
+weekly_return <- date_tbl %>% 
+  left_join(daily_return) %>% 
+  mutate(return = replace_na(return, 1)) %>% 
+  
+  group_by(code, wseq) %>% 
+  summarise(return = prod(return) - 1) %>% 
+  ungroup() 
+
+comb <- report %>% 
+  left_join(weekly_return %>% 
+              group_by(code) %>% 
+              mutate(return = lag(return)) %>% 
+              na.omit() %>% 
+              ungroup()
+            ) %>% 
+  na.omit()
+  
+comb %>% 
+  filter(code == "005930") %>% 
+  pivot_longer(c(report_count, return)) %>% 
+  ggplot(aes(wseq, value, fill = name)) + 
+  geom_col() + 
+  facet_wrap(~name, ncol = 1, scales = "free_y")
+```
+
+
